@@ -8,16 +8,15 @@ import socket
 import sys
 import time
 import struct
-from libs.hbb_common.protos.rendezvous_pb2 import RendezvousMessage, RegisterPeer
+from libs.hbb_common.protos.rendezvous_pb2 import RendezvousMessage, RegisterPeer, PunchHoleRequest, RegisterPk
 
 def create_punch_hole_message():
     """创建一个PunchHoleRequest消息"""
     punch_hole = PunchHoleRequest()
     punch_hole.id = "129473391"
     punch_hole.nat_type = 0
-    punch_hole.local_port = 12345
-    punch_hole.license_key = "123"
-    punch_hole.server_key = b"Wt+jdXMqZIDM9jwfF7OdrE8ho2XjO48YdmcDPgtaaH0="
+    punch_hole.udp_port = 12345
+    punch_hole.licence_key = "123"
     
     rendezvous_msg = RendezvousMessage()
     rendezvous_msg.punch_hole_request.CopyFrom(punch_hole)
@@ -51,91 +50,144 @@ def encode_length(length):
     else:
         raise ValueError("Message too large")
 
-def send_protobuf_message(host, port):
-    """发送protobuf消息到RustDesk服务器"""
+def send_punch_hole_request(host, port):
+    """发送PunchHoleRequest消息"""
     try:
-        # 创建TCP连接
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)
+        sock.settimeout(5)
         
         print(f"连接到 {host}:{port}...")
         sock.connect((host, port))
         print("连接成功!")
         
-        # 创建protobuf消息
-        protobuf_data = create_register_peer_message()
-        print(f"Protobuf消息大小: {len(protobuf_data)} 字节")
+        # 发送PunchHoleRequest
+        punch_data = create_punch_hole_message()
+        punch_length_header = encode_length(len(punch_data))
         
-        # 使用RustDesk的自定义长度编码
+        print("发送PunchHoleRequest...")
+        sock.send(punch_length_header)
+        sock.send(punch_data)
+        
+        # 等待响应
+        print("等待PunchHoleResponse...")
+        sock.settimeout(2.0)
+        response_data = b""
+        try:
+            while True:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                response_data += chunk
+        except socket.timeout:
+            pass
+        
+        print(f"收到PunchHoleResponse: {len(response_data)} 字节")
+        return len(response_data) > 0
+        
+    except Exception as e:
+        print(f"PunchHoleRequest失败: {e}")
+        return False
+    finally:
+        sock.close()
+
+def send_register_pk_request(host, port):
+    """发送RegisterPk消息"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        
+        print(f"连接到 {host}:{port}...")
+        sock.connect((host, port))
+        print("连接成功!")
+        
+        # 发送RegisterPk消息
+        protobuf_data = create_register_pk_message()
+        print(f"RegisterPk消息大小: {len(protobuf_data)} 字节")
+        
         length_header = encode_length(len(protobuf_data))
         print(f"长度头: {length_header.hex()}")
         
-        # 发送长度头
         sock.send(length_header)
-        
-        # 发送protobuf数据
         sock.send(protobuf_data)
-        print("消息已发送!")
+        print("RegisterPk消息已发送!")
         
         # 等待响应
-        print("等待响应...")
-        # 先读取长度头
-        response_length_data = sock.recv(4)
-        print(f"收到长度头数据: {len(response_length_data)} 字节, 内容: {response_length_data.hex()}")
+        print("等待RegisterPkResponse...")
+        sock.settimeout(3.0)
+        response_data = b""
+        try:
+            while True:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                response_data += chunk
+                print(f"收到数据块: {len(chunk)} 字节, 总数据: {len(response_data)} 字节")
+        except socket.timeout:
+            print("接收超时")
         
-        if len(response_length_data) >= 1:
-            # 解析长度头
-            first_byte = response_length_data[0]
+        print(f"总共收到响应数据: {len(response_data)} 字节")
+        print(f"响应数据: {response_data.hex()}")
+        
+        # 解析响应
+        if len(response_data) >= 1:
+            first_byte = response_data[0]
             header_len = (first_byte & 0x3) + 1
             print(f"第一个字节: 0x{first_byte:02x}, 头部长度: {header_len}")
             
-            if len(response_length_data) < header_len:
-                # 需要读取更多数据
-                remaining = header_len - len(response_length_data)
-                print(f"需要读取更多数据: {remaining} 字节")
-                response_length_data += sock.recv(remaining)
-                print(f"完整长度头: {response_length_data.hex()}")
-            
-            # 解析长度
-            if header_len == 1:
-                response_length = (first_byte >> 2) & 0x3F
-            elif header_len == 2:
-                response_length = struct.unpack('<H', response_length_data[:2])[0] >> 2
-            elif header_len == 3:
-                h = struct.unpack('<HB', response_length_data[:3])
-                response_length = ((h[0] | (h[1] << 16)) >> 2) & 0x3FFFFF
-            else:  # header_len == 4
-                response_length = struct.unpack('<I', response_length_data[:4])[0] >> 2
-            
-            print(f"解析的响应长度: {response_length} 字节")
-            
-            if response_length > 0 and response_length < 10000:  # 合理的长度范围
-                # 读取响应数据
-                response_data = sock.recv(response_length)
-                print(f"收到响应: {len(response_data)} 字节")
+            if len(response_data) >= header_len:
+                n = first_byte
+                if header_len > 1:
+                    n |= response_data[1] << 8
+                if header_len > 2:
+                    n |= response_data[2] << 16
+                if header_len > 3:
+                    n |= response_data[3] << 24
+                response_length = n >> 2
                 
-                # 尝试解析响应
-                try:
-                    response_msg = RendezvousMessage()
-                    response_msg.ParseFromString(response_data)
-                    print("响应解析成功!")
-                    print(f"响应类型: {response_msg.WhichOneof('union')}")
-                    if response_msg.HasField('register_pk'):
-                        print(f"RegisterPk响应: {response_msg.register_pk}")
-                    elif response_msg.HasField('register_pk_response'):
-                        print(f"RegisterPkResponse: {response_msg.register_pk_response}")
-                except Exception as e:
-                    print(f"响应解析失败: {e}")
-                    print(f"原始响应数据: {response_data.hex()}")
-            else:
-                print(f"响应长度异常: {response_length}")
-        else:
-            print("未收到有效的响应长度")
-            
+                print(f"解析的响应长度: {response_length} 字节")
+                
+                if response_length > 0 and response_length < 10000:
+                    start_pos = header_len
+                    end_pos = start_pos + response_length
+                    
+                    if end_pos <= len(response_data):
+                        response_payload = response_data[start_pos:end_pos]
+                        print(f"提取的响应载荷: {len(response_payload)} 字节")
+                        
+                        try:
+                            response_msg = RendezvousMessage()
+                            response_msg.ParseFromString(response_payload)
+                            print("响应解析成功!")
+                            print(f"响应类型: {response_msg.WhichOneof('union')}")
+                            
+                            if response_msg.HasField('register_pk_response'):
+                                print(f"RegisterPkResponse: {response_msg.register_pk_response}")
+                                return True
+                        except Exception as e:
+                            print(f"响应解析失败: {e}")
+                            print(f"原始响应载荷: {response_payload.hex()}")
+        
+        return False
+        
     except Exception as e:
-        print(f"连接失败: {e}")
+        print(f"RegisterPkRequest失败: {e}")
+        return False
     finally:
         sock.close()
+
+def send_protobuf_message(host, port):
+    """发送protobuf消息到RustDesk服务器"""
+    print("步骤1: 发送PunchHoleRequest...")
+    if send_punch_hole_request(host, port):
+        print("PunchHoleRequest成功!")
+        
+        print("\n步骤2: 发送RegisterPk...")
+        if send_register_pk_request(host, port):
+            print("RegisterPk成功!")
+        else:
+            print("RegisterPk失败!")
+    else:
+        print("PunchHoleRequest失败!")
         print("连接已关闭")
 
 def main():
