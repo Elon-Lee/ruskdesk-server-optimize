@@ -27,6 +27,7 @@ use std::{
     net::SocketAddr,
     sync::atomic::{AtomicUsize, Ordering},
 };
+use crate::custom_keys::CustomKeyManager;
 
 type Usage = (usize, usize, usize, usize);
 
@@ -36,6 +37,12 @@ lazy_static::lazy_static! {
     static ref BLACKLIST: RwLock<HashSet<String>> = Default::default();
     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
 }
+
+static CUSTOM_KEY_MANAGER: once_cell::sync::Lazy<CustomKeyManager> = once_cell::sync::Lazy::new(|| {
+    // Use a simple synchronous initialization for now
+    // In a real implementation, you might want to use a different approach
+    CustomKeyManager::new_sync("custom_keys.json")
+});
 
 static DOWNGRADE_THRESHOLD_100: AtomicUsize = AtomicUsize::new(66); // 0.66
 static DOWNGRADE_START_CHECK: AtomicUsize = AtomicUsize::new(1_800_000); // in ms
@@ -427,8 +434,18 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
             if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
+                // Check traditional key first
                 if !key.is_empty() && rf.licence_key != key {
-                    return;
+                    // Check custom key if traditional key doesn't match
+                    if !rf.custom_key.is_empty() {
+                        if !CUSTOM_KEY_MANAGER.is_valid_key(&rf.custom_key).await {
+                            log::warn!("Invalid or expired custom key for relay: {}", rf.custom_key);
+                            return;
+                        }
+                        log::info!("Valid custom key used for relay: {}", rf.custom_key);
+                    } else {
+                        return;
+                    }
                 }
                 if !rf.uuid.is_empty() {
                     let mut peer = PEERS.lock().await.remove(&rf.uuid);

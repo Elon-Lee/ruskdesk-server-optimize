@@ -1,4 +1,5 @@
 use crate::common::*;
+use crate::custom_keys::CustomKeyManager;
 use crate::peer::*;
 use hbb_common::{
     allow_err, bail,
@@ -80,6 +81,7 @@ pub struct RendezvousServer {
     relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
+    custom_key_manager: CustomKeyManager,
 }
 
 enum LoopFailure {
@@ -119,6 +121,9 @@ impl RendezvousServer {
                     .unwrap_or_default(),
             )
         };
+        let custom_keys_file = get_arg_or("custom-keys-file", "custom_keys.json".to_string());
+        let custom_key_manager = CustomKeyManager::new(&custom_keys_file).await;
+        log::info!("Using custom keys file: {}", custom_keys_file);
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             pm,
@@ -134,6 +139,7 @@ impl RendezvousServer {
                 mask,
                 local_ip,
             }),
+            custom_key_manager,
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -342,6 +348,16 @@ impl RendezvousServer {
                     } else if !self.check_ip_blocker(&ip, &id).await {
                         return send_rk_res(socket, addr, TOO_FREQUENT).await;
                     }
+                    
+                    // Check custom key if provided
+                    log::info!("Register request from {}: custom_key='{}'", addr, rk.custom_key);
+                    if !rk.custom_key.is_empty() {
+                        if !self.custom_key_manager.is_valid_key(&rk.custom_key).await {
+                            log::warn!("Invalid or expired custom key '{}' from client {}", rk.custom_key, addr);
+                            return send_rk_res(socket, addr, TOO_FREQUENT).await;
+                        }
+                        log::info!("Valid custom key used for registration: {}", rk.custom_key);
+                    }
                     let peer = self.pm.get_or(&id).await;
                     let (changed, ip_changed) = {
                         let peer = peer.read().await;
@@ -480,6 +496,7 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> bool {
+        log::info!("Received {} bytes from {}: {:?}", bytes.len(), addr, &bytes[..std::cmp::min(50, bytes.len())]);
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
@@ -545,8 +562,43 @@ impl RendezvousServer {
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                Some(rendezvous_message::Union::RegisterPk(_)) => {
-                    let res = register_pk_response::Result::NOT_SUPPORT;
+                Some(rendezvous_message::Union::RegisterPeer(rp)) => {
+                    // Handle RegisterPeer message in TCP
+                    if !rp.id.is_empty() {
+                        log::trace!("New peer registered via TCP: {:?} {:?}", &rp.id, &addr);
+                        // Update peer address in memory
+                        if let Some(peer) = self.pm.get_in_memory(&rp.id).await {
+                            let mut peer_guard = peer.write().await;
+                            peer_guard.socket_addr = addr;
+                            peer_guard.last_reg_time = Instant::now();
+                        }
+                        
+                        // Send RegisterPeerResponse
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_register_peer_response(RegisterPeerResponse {
+                            request_pk: true, // Request public key registration
+                            ..Default::default()
+                        });
+                        Self::send_to_sink(sink, msg_out).await;
+                    }
+                }
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    let res = if rk.uuid.is_empty() || rk.pk.is_empty() {
+                        register_pk_response::Result::UUID_MISMATCH
+                    } else {
+                        // Check if this is a custom key registration
+                        if !rk.custom_key.is_empty() {
+                            if self.custom_key_manager.is_valid_key(&rk.custom_key).await {
+                                register_pk_response::Result::OK
+                            } else {
+                                register_pk_response::Result::TOO_FREQUENT // Use as invalid key response
+                            }
+                        } else {
+                            // Fall back to original public key registration
+                            register_pk_response::Result::NOT_SUPPORT
+                        }
+                    };
+                    
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
                         result: res.into(),
@@ -679,7 +731,26 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
-        if !key.is_empty() && ph.licence_key != key {
+        
+        // 首先检查自定义密钥
+        log::info!("Punch hole request from {}: licence_key='{}', server_key='{}'", 
+                  addr, ph.licence_key, key);
+        
+        if !ph.licence_key.is_empty() {
+            if self.custom_key_manager.is_valid_key(&ph.licence_key).await {
+                log::info!("Client {} authenticated with custom key: {}", addr, ph.licence_key);
+            } else {
+                log::warn!("Invalid custom key '{}' from client {}", ph.licence_key, addr);
+                let mut msg_out = RendezvousMessage::new();
+                msg_out.set_punch_hole_response(PunchHoleResponse {
+                    failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                    ..Default::default()
+                });
+                return Ok((msg_out, None));
+            }
+        } else if !key.is_empty() {
+            // 如果没有提供许可证密钥，使用默认密钥验证
+            log::warn!("No licence key provided from client {}, server requires key", addr);
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),

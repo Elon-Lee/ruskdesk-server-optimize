@@ -4,3 +4,5 @@ pub mod common;
 mod database;
 mod peer;
 mod version;
+mod custom_keys;
+pub use custom_keys::*;

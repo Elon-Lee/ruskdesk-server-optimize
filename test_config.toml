@@ -1,0 +1,8 @@
+# Test configuration for custom keys
+[rendezvous]
+port = 21116
+key = "test-key-123"
+custom_keys_file = "test_custom_keys.json"
+
+[relay]
+port = 21117
