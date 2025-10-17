@@ -354,12 +354,21 @@ impl RendezvousServer {
                     // Check custom key if provided
                     log::info!("Register request from {}: custom_key='{}'", addr, rk.custom_key);
                     if !rk.custom_key.is_empty() {
-                        // Prefer DB validation when available
-                        if !self.pm.db.is_key_valid(&rk.custom_key).await.unwrap_or(false) {
+                        // Distinguish invalid vs overuse; allow if already bound
+                        let (valid, already, overuse) = self.pm.db.check_binding_state(&rk.custom_key, &id).await.unwrap_or((false,false,false));
+                        if !valid {
                             log::warn!("Invalid or expired custom key '{}' from client {}", rk.custom_key, addr);
-                            return send_rk_res(socket, addr, TOO_FREQUENT).await;
+                            return send_rk_res(socket, addr, TOO_FREQUENT).await; // use mismatch for invalid
                         }
-                        log::info!("Valid custom key used for registration: {}", rk.custom_key);
+                        if overuse && !already {
+                            log::warn!("Custom key '{}' overuse for id {} from {}", rk.custom_key, id, addr);
+                            return send_rk_res(socket, addr, TOO_FREQUENT).await; // registration path does not expose overuse code; keep as TOO_FREQUENT
+                        }
+                        // Bind if not already bound
+                        if !already {
+                            let _ = self.pm.db.ensure_binding_allowed(&rk.custom_key, &id).await;
+                        }
+                        log::info!("Valid custom key used for registration: {} (already_bound={})", rk.custom_key, already);
                     }
                     let peer = self.pm.get_or(&id).await;
                     let (changed, ip_changed) = {
@@ -740,9 +749,9 @@ impl RendezvousServer {
                   addr, ph.licence_key, key);
         
         if !ph.licence_key.is_empty() {
-            if self.pm.db.is_key_valid(&ph.licence_key).await.unwrap_or(false) {
-                log::info!("Client {} authenticated with custom key: {}", addr, ph.licence_key);
-            } else {
+            // Distinguish invalid vs overuse; do not impact already-bound ids
+            let (valid, already, overuse) = self.pm.db.check_binding_state(&ph.licence_key, &ph.id).await.unwrap_or((false,false,false));
+            if !valid {
                 log::warn!("Invalid custom key '{}' from client {}", ph.licence_key, addr);
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -751,6 +760,20 @@ impl RendezvousServer {
                 });
                 return Ok((msg_out, None));
             }
+            if overuse && !already {
+                log::warn!("Custom key '{}' overuse for id {} from {}", ph.licence_key, ph.id, addr);
+                let mut msg_out = RendezvousMessage::new();
+                msg_out.set_punch_hole_response(PunchHoleResponse {
+                    failure: punch_hole_response::Failure::LICENSE_OVERUSE.into(),
+                    ..Default::default()
+                });
+                return Ok((msg_out, None));
+            }
+            // Bind when valid and not yet bound
+            if !already {
+                let _ = self.pm.db.ensure_binding_allowed(&ph.licence_key, &ph.id).await;
+            }
+            log::info!("Client {} authenticated with custom key: {} (already_bound={})", addr, ph.licence_key, already);
         } else if !key.is_empty() {
             // 如果没有提供许可证密钥，使用默认密钥验证
             log::warn!("No licence key provided from client {}, server requires key", addr);

@@ -443,6 +443,7 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                 if !key.is_empty() && rf.licence_key != key {
                     // Check DB custom key if traditional key doesn't match
                     if !rf.custom_key.is_empty() {
+                        // We can't get the binding id from relay request reliably; still enforce validity.
                         if !is_key_valid_db(&rf.custom_key).await {
                             log::warn!("Invalid or expired custom key for relay: {}", rf.custom_key);
                             return;

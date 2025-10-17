@@ -30,6 +30,7 @@ struct CreateKeyForm {
     key: Option<String>,
     duration: Option<String>, // e.g. 10d,2w,3m,1y,permanent
     note: Option<String>,
+    max_bind_ids: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,8 +123,15 @@ async fn create_key(Extension(state): Extension<AdminState>, Form(p): Form<Creat
         },
         None => chrono::Utc::now().timestamp() + 86400 * 30,
     };
-    let _ = state.db.insert_key(&key, expired_at, true, p.note.as_deref()).await;
+    let max_bind = p.max_bind_ids.unwrap_or(3).clamp(1, 1000);
+    let _ = state.db.insert_key(&key, expired_at, true, p.note.as_deref(), max_bind).await;
     Html(format!("<meta http-equiv=\"refresh\" content=\"0;url=/admin\"><p>Created key: {}</p>", key))
+}
+
+async fn set_key_max_bind(Extension(state): Extension<AdminState>, Path((key, n)): Path<(String, i32)>) -> Html<String> {
+    let n = n.clamp(1, 1000);
+    let _ = state.db.set_key_max_bind(&key, n).await;
+    Html("<meta http-equiv=\"refresh\" content=\"0;url=/admin\">".to_string())
 }
 
 async fn extend_key(Extension(state): Extension<AdminState>, Path(key): Path<String>, Query(p): Query<ExtendParams>) -> Html<String> {
@@ -177,6 +185,9 @@ async fn index_html() -> Html<String> {
           <div style='margin-bottom:8px'>
             <label>备注: <input name='note' maxlength='200' /></label>
           </div>
+          <div style='margin-bottom:8px'>
+            <label>最大可绑定ID数: <input type='number' min='1' max='1000' name='max_bind_ids' value='3' /></label>
+          </div>
           <div>
             <button type='submit'>创建</button>
             <button type='button' onclick='closeCreate()'>取消</button>
@@ -199,6 +210,11 @@ async fn index_html() -> Html<String> {
             <td>${new Date(k.expired_at*1000).toLocaleString()}</td>
             <td>${k.active ? '有效' : '无效'}</td>
             <td>
+              <span>${k.max_bind_ids}</span>
+              <button class='inline' onclick='changeMax("${k.licence_key}", ${Math.max(1,(k.max_bind_ids||3)-1)})'>-</button>
+              <button class='inline' onclick='changeMax("${k.licence_key}", ${(k.max_bind_ids||3)+1})'>+</button>
+            </td>
+            <td>
               <a href='/api/keys/${k.licence_key}/extend?option=1d'>+1天</a>
               <a href='/api/keys/${k.licence_key}/extend?option=7d'>+7天</a>
               <a href='/api/keys/${k.licence_key}/extend?option=1m'>+1个月</a>
@@ -211,7 +227,7 @@ async fn index_html() -> Html<String> {
         const cur = Math.floor(offset/limit)+1;
         document.getElementById('list').innerHTML = `
           <table>
-            <thead><tr><th>Key</th><th>注册日期</th><th>过期日期</th><th>有效状态</th><th>操作</th></tr></thead>
+            <thead><tr><th>Key</th><th>注册日期</th><th>过期日期</th><th>有效状态</th><th>最大绑定数</th><th>操作</th></tr></thead>
             <tbody>${rows}</tbody>
           </table>
           <div style='margin-top:12px'>
@@ -226,6 +242,7 @@ async fn index_html() -> Html<String> {
       function openCreate(){ document.getElementById('createModal').style.display='block'; }
       function closeCreate(){ document.getElementById('createModal').style.display='none'; }
       async function submitCreate(e){ e.preventDefault(); const f = document.getElementById('createForm'); const body = new URLSearchParams(new FormData(f)); const res = await fetch('/api/keys', { method:'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }, body }); await res.text(); closeCreate(); load(); return false; }
+      async function changeMax(key, n){ await fetch(`/api/keys/${key}/max/${n}`); load(); }
       load();
     </script>
   </body>
@@ -240,6 +257,7 @@ pub async fn spawn_admin(db: Database, base_port: i32) {
         .route("/api/keys", get(list_keys).post(create_key))
         .route("/api/keys/generate", get(|| async { generate_default_key() }))
         .route("/api/keys/:key/extend", get(extend_key))
+        .route("/api/keys/:key/max/:n", get(set_key_max_bind))
         .route("/api/keys/:key/active/:flag", get(set_key_active))
         .layer(middleware::from_fn(auth_middleware))
         .layer(axum::Extension(state));

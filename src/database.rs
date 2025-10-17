@@ -101,8 +101,18 @@ impl Database {
         .await?;
         // Create indices separately to avoid prepare-time dependency on table existence
         for stmt in [
+            // Add column for max bindings if it does not exist; ignore error if already added
+            "alter table licence_keys add column max_bind_ids integer not null default 3;",
+            // Table to track unique bindings between licence key and peer id
+            "create table if not exists licence_key_bindings (
+                licence_key text not null,
+                peer_id text not null,
+                bound_at integer not null,
+                primary key (licence_key, peer_id)
+            );",
             "create index if not exists index_licence_keys_active on licence_keys (active);",
             "create index if not exists index_licence_keys_expired_at on licence_keys (expired_at);",
+            "create index if not exists index_bindings_key on licence_key_bindings (licence_key);",
         ] {
             let _ = sqlx::query(stmt)
                 .execute(self.pool.get().await?.deref_mut())
@@ -184,14 +194,15 @@ impl Database {
         }
     }
 
-    pub async fn insert_key(&self, key: &str, expired_at: i64, active: bool, note: Option<&str>) -> ResultType<()> {
+    pub async fn insert_key(&self, key: &str, expired_at: i64, active: bool, note: Option<&str>, max_bind_ids: i32) -> ResultType<()> {
         let now = chrono::Utc::now().timestamp();
-        sqlx::query("insert into licence_keys(licence_key, registered_at, expired_at, active, note) values(?, ?, ?, ?, ?)")
+        sqlx::query("insert into licence_keys(licence_key, registered_at, expired_at, active, note, max_bind_ids) values(?, ?, ?, ?, ?, ?)")
         .bind(key)
         .bind(now)
         .bind(expired_at)
         .bind(if active { 1 } else { 0 })
         .bind(note)
+        .bind(max_bind_ids)
         .execute(self.pool.get().await?.deref_mut())
         .await?;
         Ok(())
@@ -218,7 +229,7 @@ impl Database {
 
     pub async fn list_keys(&self, offset: i64, limit: i64) -> ResultType<Vec<LicenceKey>> {
         let rows = sqlx::query(
-            "select licence_key, registered_at, expired_at, active, note from licence_keys order by registered_at desc limit ? offset ?",
+            "select licence_key, registered_at, expired_at, active, note, max_bind_ids from licence_keys order by registered_at desc limit ? offset ?",
         )
         .bind(limit)
         .bind(offset)
@@ -232,7 +243,8 @@ impl Database {
                 let expired_at: i64 = r.try_get("expired_at").unwrap_or_default();
                 let active: i64 = r.try_get("active").unwrap_or_default();
                 let note: Option<String> = r.try_get("note").ok();
-                LicenceKey { licence_key, registered_at, expired_at, active, note }
+                let max_bind_ids: i64 = r.try_get("max_bind_ids").unwrap_or(3);
+                LicenceKey { licence_key, registered_at, expired_at, active, note, max_bind_ids }
             })
             .collect())
     }
@@ -255,7 +267,7 @@ impl Database {
 
     pub async fn get_key(&self, key: &str) -> ResultType<Option<LicenceKey>> {
         let r = sqlx::query(
-            "select licence_key, registered_at, expired_at, active, note from licence_keys where licence_key = ?",
+            "select licence_key, registered_at, expired_at, active, note, max_bind_ids from licence_keys where licence_key = ?",
         )
         .bind(key)
         .fetch_optional(self.pool.get().await?.deref_mut())
@@ -266,8 +278,104 @@ impl Database {
             let expired_at: i64 = r.try_get("expired_at").unwrap_or_default();
             let active: i64 = r.try_get("active").unwrap_or_default();
             let note: Option<String> = r.try_get("note").ok();
-            LicenceKey { licence_key, registered_at, expired_at, active, note }
+            let max_bind_ids: i64 = r.try_get("max_bind_ids").unwrap_or(3);
+            LicenceKey { licence_key, registered_at, expired_at, active, note, max_bind_ids }
         }))
+    }
+
+    pub async fn set_key_max_bind(&self, key: &str, n: i32) -> ResultType<()> {
+        sqlx::query("update licence_keys set max_bind_ids = ? where licence_key = ?")
+        .bind(n)
+        .bind(key)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn ensure_binding_allowed(&self, key: &str, peer_id: &str) -> ResultType<bool> {
+        // If already bound, allow
+        let exists = sqlx::query("select 1 as x from licence_key_bindings where licence_key = ? and peer_id = ? limit 1")
+            .bind(key)
+            .bind(peer_id)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?;
+        if exists.is_some() {
+            return Ok(true);
+        }
+
+        // Check validity and current count vs max in a transaction
+        let mut conn = self.pool.get().await?;
+        let mut tx = conn.begin().await?;
+        let now = chrono::Utc::now().timestamp();
+        let rec = sqlx::query("select max_bind_ids, active, expired_at from licence_keys where licence_key = ?")
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if let Some(r) = rec {
+            let max_bind: i64 = r.try_get("max_bind_ids").unwrap_or(3);
+            let active: i64 = r.try_get("active").unwrap_or(0);
+            let expired_at: i64 = r.try_get("expired_at").unwrap_or(0);
+            if !(active != 0 && expired_at > now) {
+                tx.rollback().await.ok();
+                return Ok(false);
+            }
+            let cnt_row = sqlx::query("select count(1) as cnt from licence_key_bindings where licence_key = ?")
+                .bind(key)
+                .fetch_one(&mut *tx)
+                .await?;
+            let cnt: i64 = cnt_row.try_get("cnt").unwrap_or(0);
+            if cnt >= max_bind {
+                tx.rollback().await.ok();
+                return Ok(false);
+            }
+            // Insert binding
+            sqlx::query("insert into licence_key_bindings(licence_key, peer_id, bound_at) values(?, ?, ?)")
+                .bind(key)
+                .bind(peer_id)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(true)
+        } else {
+            tx.rollback().await.ok();
+            Ok(false)
+        }
+    }
+
+    // Tri-state check to distinguish invalid vs overuse while not modifying state.
+    // Returns (exists_and_valid, already_bound, overuse)
+    pub async fn check_binding_state(&self, key: &str, peer_id: &str) -> ResultType<(bool, bool, bool)> {
+        // Already bound stays allowed and unaffected
+        let already = sqlx::query("select 1 as x from licence_key_bindings where licence_key = ? and peer_id = ? limit 1")
+            .bind(key)
+            .bind(peer_id)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?
+            .is_some();
+
+        let now = chrono::Utc::now().timestamp();
+        let r = sqlx::query("select max_bind_ids, active, expired_at from licence_keys where licence_key = ?")
+            .bind(key)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?;
+        if let Some(r) = r {
+            let active: i64 = r.try_get("active").unwrap_or(0);
+            let expired_at: i64 = r.try_get("expired_at").unwrap_or(0);
+            if !(active != 0 && expired_at > now) {
+                return Ok((false, already, false));
+            }
+            let max_bind: i64 = r.try_get("max_bind_ids").unwrap_or(3);
+            let cnt_row = sqlx::query("select count(1) as cnt from licence_key_bindings where licence_key = ?")
+                .bind(key)
+                .fetch_one(self.pool.get().await?.deref_mut())
+                .await?;
+            let cnt: i64 = cnt_row.try_get("cnt").unwrap_or(0);
+            let overuse = !already && cnt >= max_bind;
+            Ok((true, already, overuse))
+        } else {
+            Ok((false, already, false))
+        }
     }
 }
 
@@ -280,6 +388,7 @@ pub struct LicenceKey {
     pub expired_at: i64,
     pub active: i64,
     pub note: Option<String>,
+    pub max_bind_ids: i64,
 }
 
 #[cfg(test)]
