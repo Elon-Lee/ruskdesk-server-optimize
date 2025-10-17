@@ -252,6 +252,23 @@ impl Database {
             .await?;
         Ok(r.is_some())
     }
+
+    pub async fn get_key(&self, key: &str) -> ResultType<Option<LicenceKey>> {
+        let r = sqlx::query(
+            "select licence_key, registered_at, expired_at, active, note from licence_keys where licence_key = ?",
+        )
+        .bind(key)
+        .fetch_optional(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(r.map(|r| {
+            let licence_key: String = r.try_get("licence_key").unwrap_or_default();
+            let registered_at: i64 = r.try_get("registered_at").unwrap_or_default();
+            let expired_at: i64 = r.try_get("expired_at").unwrap_or_default();
+            let active: i64 = r.try_get("active").unwrap_or_default();
+            let note: Option<String> = r.try_get("note").ok();
+            LicenceKey { licence_key, registered_at, expired_at, active, note }
+        }))
+    }
 }
 
 use serde::Serialize;

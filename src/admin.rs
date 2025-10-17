@@ -22,6 +22,7 @@ pub struct AdminState {
 struct ListParams {
     offset: Option<i64>,
     limit: Option<i64>,
+    key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +90,13 @@ fn is_valid_key_format(s: &str) -> bool {
 }
 
 async fn list_keys(Extension(state): Extension<AdminState>, Query(p): Query<ListParams>) -> Json<ListResponse> {
+    if let Some(k) = p.key.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let mut items = vec![];
+        if let Ok(Some(rec)) = state.db.get_key(k).await {
+            items.push(rec);
+        }
+        return Json(ListResponse { total: items.len() as i64, items });
+    }
     let offset = p.offset.unwrap_or(0);
     let limit = p.limit.unwrap_or(20).clamp(1, 100);
     let total = state.db.count_keys().await.unwrap_or(0);
@@ -149,21 +157,40 @@ async fn index_html() -> Html<String> {
   </head>
   <body>
     <h2>Keys Admin</h2>
-    <form method='post' action='/api/keys'>
-      <label>Key（32位UUID，无-）: <input id='key' name='key' maxlength='32' pattern='[0-9a-fA-F]{32}' /></label>
-      <button type='button' onclick='gen()'>生成</button>
-      <label>时长:
-        <input id='duration' name='duration' placeholder='如: 10d/2w/3m/1y/permanent' />
-      </label>
-      <label>备注: <input name='note' maxlength='200' /></label>
-      <button type='submit'>新增Key</button>
-    </form>
+    <div style='margin-bottom:12px;'>
+      <input id='searchKey' placeholder='按Key查询（32位HEX）' style='width:260px' />
+      <button type='button' onclick='searchByKey()'>查询</button>
+      <button type='button' onclick='openCreate()'>新增</button>
+    </div>
+
+    <div id='createModal' style='display:none; position:fixed; left:0; top:0; right:0; bottom:0; background:rgba(0,0,0,.35);'>
+      <div style='background:#fff; padding:16px; width:560px; margin:10% auto; box-shadow:0 8px 32px rgba(0,0,0,.2)'>
+        <h3>创建新Key</h3>
+        <form id='createForm' method='post' action='/api/keys' onsubmit='return submitCreate(event)'>
+          <div style='margin-bottom:8px'>
+            <label>Key（32位UUID，无-）: <input id='key' name='key' maxlength='32' pattern='[0-9a-fA-F]{32}' /></label>
+            <button type='button' onclick='gen()'>生成</button>
+          </div>
+          <div style='margin-bottom:8px'>
+            <label>时长: <input id='duration' name='duration' placeholder='如: 10d/2w/3m/1y/permanent' /></label>
+          </div>
+          <div style='margin-bottom:8px'>
+            <label>备注: <input name='note' maxlength='200' /></label>
+          </div>
+          <div>
+            <button type='submit'>创建</button>
+            <button type='button' onclick='closeCreate()'>取消</button>
+          </div>
+        </form>
+      </div>
+    </div>
     <div id='list'></div>
     <script>
       function gen(){ fetch('/api/keys/generate').then(r=>r.text()).then(t=>{ document.getElementById('key').value = t; }); }
-      let offset = 0, limit = 20;
+      let offset = 0, limit = 20; let currentKey = '';
       async function load() {
-        const res = await fetch(`/api/keys?offset=${offset}&limit=${limit}`);
+        const q = currentKey ? `&key=${encodeURIComponent(currentKey)}` : '';
+        const res = await fetch(`/api/keys?offset=${offset}&limit=${limit}${q}`);
         const data = await res.json();
         const rows = data.items.map(k => `
           <tr>
@@ -180,7 +207,7 @@ async fn index_html() -> Html<String> {
               ${k.active ? `<a href='/api/keys/${k.licence_key}/active/0' style='color:#c00'>作废</a>` : `<a href='/api/keys/${k.licence_key}/active/1'>启用</a>`}
             </td>
           </tr>`).join('');
-        const totalPages = Math.ceil(data.total/limit);
+        const totalPages = currentKey ? 1 : Math.ceil(data.total/limit);
         const cur = Math.floor(offset/limit)+1;
         document.getElementById('list').innerHTML = `
           <table>
@@ -188,13 +215,17 @@ async fn index_html() -> Html<String> {
             <tbody>${rows}</tbody>
           </table>
           <div style='margin-top:12px'>
-            <button ${offset<=0?'disabled':''} onclick='prev()'>上一页</button>
-            <span>第 ${cur} / ${totalPages||1} 页</span>
-            <button ${offset+limit>=data.total?'disabled':''} onclick='next()'>下一页</button>
+            ${currentKey ? '' : `<button ${offset<=0?'disabled':''} onclick='prev()'>上一页</button>`}
+            ${currentKey ? '' : `<span>第 ${cur} / ${totalPages||1} 页</span>`}
+            ${currentKey ? '' : `<button ${offset+limit>=data.total?'disabled':''} onclick='next()'>下一页</button>`}
           </div>`;
       }
       function prev(){ if(offset>0){ offset-=limit; load(); }}
       function next(){ offset+=limit; load(); }
+      function searchByKey(){ currentKey = document.getElementById('searchKey').value.trim(); offset = 0; load(); }
+      function openCreate(){ document.getElementById('createModal').style.display='block'; }
+      function closeCreate(){ document.getElementById('createModal').style.display='none'; }
+      async function submitCreate(e){ e.preventDefault(); const f = document.getElementById('createForm'); const body = new URLSearchParams(new FormData(f)); const res = await fetch('/api/keys', { method:'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }, body }); await res.text(); closeCreate(); load(); return false; }
       load();
     </script>
   </body>
