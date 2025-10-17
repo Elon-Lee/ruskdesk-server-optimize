@@ -28,6 +28,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use crate::custom_keys::CustomKeyManager;
+use hbbs::Database;
 
 type Usage = (usize, usize, usize, usize);
 
@@ -38,11 +39,15 @@ lazy_static::lazy_static! {
     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
 }
 
-static CUSTOM_KEY_MANAGER: once_cell::sync::Lazy<CustomKeyManager> = once_cell::sync::Lazy::new(|| {
-    // Use a simple synchronous initialization for now
-    // In a real implementation, you might want to use a different approach
-    CustomKeyManager::new_sync("custom_keys.json")
-});
+// Rendezvous/hbbr do not share state; for hbbr validation we will lazy-check via SQLite path
+// We reuse the same DB URL discovery logic from PeerMap::new by reading DB_URL or default file.
+async fn is_key_valid_db(key: &str) -> bool {
+    let db_url = std::env::var("DB_URL").unwrap_or_else(|_| "./db_v2.sqlite3".to_string());
+    if let Ok(db) = Database::new(&db_url).await {
+        return db.is_key_valid(key).await.unwrap_or(false);
+    }
+    false
+}
 
 static DOWNGRADE_THRESHOLD_100: AtomicUsize = AtomicUsize::new(66); // 0.66
 static DOWNGRADE_START_CHECK: AtomicUsize = AtomicUsize::new(1_800_000); // in ms
@@ -436,9 +441,9 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
             if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
                 // Check traditional key first
                 if !key.is_empty() && rf.licence_key != key {
-                    // Check custom key if traditional key doesn't match
+                    // Check DB custom key if traditional key doesn't match
                     if !rf.custom_key.is_empty() {
-                        if !CUSTOM_KEY_MANAGER.is_valid_key(&rf.custom_key).await {
+                        if !is_key_valid_db(&rf.custom_key).await {
                             log::warn!("Invalid or expired custom key for relay: {}", rf.custom_key);
                             return;
                         }

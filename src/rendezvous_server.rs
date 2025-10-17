@@ -1,5 +1,6 @@
 use crate::common::*;
 use crate::custom_keys::CustomKeyManager;
+use crate::admin::spawn_admin;
 use crate::peer::*;
 use hbb_common::{
     allow_err, bail,
@@ -122,8 +123,9 @@ impl RendezvousServer {
             )
         };
         let custom_keys_file = get_arg_or("custom-keys-file", "custom_keys.json".to_string());
-        let custom_key_manager = CustomKeyManager::new(&custom_keys_file).await;
-        log::info!("Using custom keys file: {}", custom_keys_file);
+        let mut custom_key_manager = CustomKeyManager::new(&custom_keys_file).await;
+        // Start admin UI (localhost) with same base port
+        spawn_admin(pm.db.clone(), port).await;
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             pm,
@@ -352,7 +354,8 @@ impl RendezvousServer {
                     // Check custom key if provided
                     log::info!("Register request from {}: custom_key='{}'", addr, rk.custom_key);
                     if !rk.custom_key.is_empty() {
-                        if !self.custom_key_manager.is_valid_key(&rk.custom_key).await {
+                        // Prefer DB validation when available
+                        if !self.pm.db.is_key_valid(&rk.custom_key).await.unwrap_or(false) {
                             log::warn!("Invalid or expired custom key '{}' from client {}", rk.custom_key, addr);
                             return send_rk_res(socket, addr, TOO_FREQUENT).await;
                         }
@@ -588,7 +591,7 @@ impl RendezvousServer {
                     } else {
                         // Check if this is a custom key registration
                         if !rk.custom_key.is_empty() {
-                            if self.custom_key_manager.is_valid_key(&rk.custom_key).await {
+                            if self.pm.db.is_key_valid(&rk.custom_key).await.unwrap_or(false) {
                                 register_pk_response::Result::OK
                             } else {
                                 register_pk_response::Result::TOO_FREQUENT // Use as invalid key response
@@ -737,7 +740,7 @@ impl RendezvousServer {
                   addr, ph.licence_key, key);
         
         if !ph.licence_key.is_empty() {
-            if self.custom_key_manager.is_valid_key(&ph.licence_key).await {
+            if self.pm.db.is_key_valid(&ph.licence_key).await.unwrap_or(false) {
                 log::info!("Client {} authenticated with custom key: {}", addr, ph.licence_key);
             } else {
                 log::warn!("Invalid custom key '{}' from client {}", ph.licence_key, addr);

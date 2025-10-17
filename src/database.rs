@@ -3,6 +3,7 @@ use hbb_common::{log, ResultType};
 use sqlx::{
     sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
 };
+use sqlx::Row;
 use std::{ops::DerefMut, str::FromStr};
 //use sqlx::postgres::PgPoolOptions;
 //use sqlx::mysql::MySqlPoolOptions;
@@ -69,7 +70,7 @@ impl Database {
     }
 
     async fn create_tables(&self) -> ResultType<()> {
-        sqlx::query!(
+        sqlx::query(
             "
             create table if not exists peer (
                 guid blob primary key not null,
@@ -86,10 +87,27 @@ impl Database {
             create index if not exists index_peer_user on peer (user);
             create index if not exists index_peer_created_at on peer (created_at);
             create index if not exists index_peer_status on peer (status);
-        "
+
+            create table if not exists licence_keys (
+                licence_key text primary key not null,
+                registered_at integer not null,
+                expired_at integer not null,
+                active integer not null default 1,
+                note text
+            );
+            "
         )
         .execute(self.pool.get().await?.deref_mut())
         .await?;
+        // Create indices separately to avoid prepare-time dependency on table existence
+        for stmt in [
+            "create index if not exists index_licence_keys_active on licence_keys (active);",
+            "create index if not exists index_licence_keys_expired_at on licence_keys (expired_at);",
+        ] {
+            let _ = sqlx::query(stmt)
+                .execute(self.pool.get().await?.deref_mut())
+                .await;
+        }
         Ok(())
     }
 
@@ -142,6 +160,97 @@ impl Database {
         .await?;
         Ok(())
     }
+
+    // ------------------------
+    // Licence key management
+    // ------------------------
+
+    pub async fn is_key_valid(&self, key: &str) -> ResultType<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let rec = sqlx::query("select expired_at, active from licence_keys where licence_key = ?")
+            .bind(key)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?;
+        if let Some(r) = rec {
+            let active: i64 = r.try_get("active").unwrap_or(0);
+            let expired_at: i64 = r.try_get("expired_at").unwrap_or(0);
+            Ok(active != 0 && expired_at > now)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn insert_key(&self, key: &str, expired_at: i64, active: bool, note: Option<&str>) -> ResultType<()> {
+        let now = chrono::Utc::now().timestamp();
+        sqlx::query("insert or replace into licence_keys(licence_key, registered_at, expired_at, active, note) values(?, ?, ?, ?, ?)")
+        .bind(key)
+        .bind(now)
+        .bind(expired_at)
+        .bind(if active { 1 } else { 0 })
+        .bind(note)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn extend_key_by(&self, key: &str, seconds: i64) -> ResultType<()> {
+        // if not exists, no-op
+        sqlx::query("update licence_keys set expired_at = expired_at + ? where licence_key = ?")
+        .bind(seconds)
+        .bind(key)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_key_active(&self, key: &str, active: bool) -> ResultType<()> {
+        sqlx::query("update licence_keys set active = ? where licence_key = ?")
+        .bind(if active { 1 } else { 0 })
+        .bind(key)
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_keys(&self, offset: i64, limit: i64) -> ResultType<Vec<LicenceKey>> {
+        let rows = sqlx::query(
+            "select licence_key, registered_at, expired_at, active, note from licence_keys order by registered_at desc limit ? offset ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let licence_key: String = r.try_get("licence_key").unwrap_or_default();
+                let registered_at: i64 = r.try_get("registered_at").unwrap_or_default();
+                let expired_at: i64 = r.try_get("expired_at").unwrap_or_default();
+                let active: i64 = r.try_get("active").unwrap_or_default();
+                let note: Option<String> = r.try_get("note").ok();
+                LicenceKey { licence_key, registered_at, expired_at, active, note }
+            })
+            .collect())
+    }
+
+    pub async fn count_keys(&self) -> ResultType<i64> {
+        let r = sqlx::query("select count(1) as cnt from licence_keys")
+            .fetch_one(self.pool.get().await?.deref_mut())
+            .await?;
+        let cnt: i64 = r.try_get("cnt").unwrap_or(0);
+        Ok(cnt)
+    }
+}
+
+use serde::Serialize;
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LicenceKey {
+    pub licence_key: String,
+    pub registered_at: i64,
+    pub expired_at: i64,
+    pub active: i64,
+    pub note: Option<String>,
 }
 
 #[cfg(test)]
