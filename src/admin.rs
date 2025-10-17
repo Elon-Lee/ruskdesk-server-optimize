@@ -267,7 +267,7 @@ pub async fn spawn_admin(db: Database, base_port: i32) {
         .ok()
         .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(base_port + 100);
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
     hbb_common::tokio::spawn(async move {
         if let Err(e) = axum::Server::bind(&addr).serve(app.into_make_service()).await {
             hbb_common::log::error!("Admin server failed: {}", e);
