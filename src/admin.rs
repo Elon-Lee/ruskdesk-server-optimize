@@ -1,5 +1,15 @@
 use crate::database::{Database, LicenceKey};
-use axum::{extract::{Path, Query, Extension, Form}, response::Html, routing::{get, post}, Json, Router};
+use axum::{
+    extract::{Path, Query, Extension, Form},
+    http::{header, Request, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use headers::authorization::{Authorization, Basic};
+use headers::HeaderMapExt;
+// removed duplicate import of StatusCode
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
@@ -17,7 +27,7 @@ struct ListParams {
 #[derive(Debug, Deserialize)]
 struct CreateKeyForm {
     key: Option<String>,
-    duration: Option<String>, // one of: 1d,7d,1m,1q,1y
+    duration: Option<String>, // e.g. 10d,2w,3m,1y,permanent
     note: Option<String>,
 }
 
@@ -32,20 +42,50 @@ struct ListResponse {
     items: Vec<LicenceKey>,
 }
 
-fn ttl_seconds_for_option(option: &str) -> i64 {
-    match option {
-        "1d" => 86400,
-        "7d" => 86400 * 7,
-        "1m" => 86400 * 30,
-        "1q" => 86400 * 90,
-        "1y" => 86400 * 365,
-        _ => 86400 * 30,
+async fn auth_middleware<B>(req: Request<B>, next: Next<B>) -> Response {
+    let user = std::env::var("ADMIN_USER").unwrap_or_else(|_| "elonlee".to_string());
+    let pass = std::env::var("ADMIN_PASS").unwrap_or_else(|_| "Yiner520@".to_string());
+    let unauthorized = || {
+        (StatusCode::UNAUTHORIZED,
+         [(header::WWW_AUTHENTICATE, header::HeaderValue::from_static("Basic realm=\"Admin\""))],
+         "Unauthorized").into_response()
+    };
+    if let Some(Authorization(basic)) = req.headers().typed_get::<Authorization<Basic>>() {
+        let u = basic.username();
+        let p = basic.password();
+        if u == user && p == pass {
+            return next.run(req).await;
+        }
     }
+    unauthorized()
+}
+
+fn ttl_seconds_for_option(option: &str) -> Option<i64> {
+    let opt = option.trim().to_lowercase();
+    if opt == "permanent" || opt == "永久" || opt == "forever" {
+        return None;
+    }
+    // pattern: <num><unit> where unit in d,w,m,y
+    let (num_part, unit_part) = opt.split_at(opt.len().saturating_sub(1));
+    let n: i64 = num_part.parse().unwrap_or(0).max(0);
+    let seconds = match unit_part {
+        "d" => 86400 * n,
+        "w" => 86400 * 7 * n,
+        "m" => 86400 * 30 * n,
+        "y" => 86400 * 365 * n,
+        _ => 0,
+    };
+    Some(seconds.max(0))
 }
 
 fn generate_default_key() -> String {
-    let raw = uuid::Uuid::new_v4().simple().to_string();
-    raw[..16].to_string()
+    // 32位 UUID（无中划线）
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+fn is_valid_key_format(s: &str) -> bool {
+    let ok_len = s.len() == 32;
+    ok_len && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 async fn list_keys(Extension(state): Extension<AdminState>, Query(p): Query<ListParams>) -> Json<ListResponse> {
@@ -57,16 +97,39 @@ async fn list_keys(Extension(state): Extension<AdminState>, Query(p): Query<List
 }
 
 async fn create_key(Extension(state): Extension<AdminState>, Form(p): Form<CreateKeyForm>) -> Html<String> {
-    let key = p.key.unwrap_or_else(generate_default_key);
-    let seconds = ttl_seconds_for_option(p.duration.as_deref().unwrap_or("1m"));
-    let expired_at = chrono::Utc::now().timestamp() + seconds;
+    let mut key = p.key.unwrap_or_else(generate_default_key);
+    if key.trim().is_empty() {
+        return Html("<p style='color:red'>Key不能为空</p>".to_string());
+    }
+    if !is_valid_key_format(&key) {
+        return Html("<p style='color:red'>Key必须为32位UUID（无中划线）</p>".to_string());
+    }
+    if state.db.key_exists(&key).await.unwrap_or(false) {
+        return Html("<p style='color:red'>Key已存在</p>".to_string());
+    }
+    let expired_at = match p.duration.as_deref() {
+        Some(d) => match ttl_seconds_for_option(d) {
+            Some(sec) => chrono::Utc::now().timestamp() + sec,
+            None => i64::MAX / 2, // 近似永久
+        },
+        None => chrono::Utc::now().timestamp() + 86400 * 30,
+    };
     let _ = state.db.insert_key(&key, expired_at, true, p.note.as_deref()).await;
     Html(format!("<meta http-equiv=\"refresh\" content=\"0;url=/admin\"><p>Created key: {}</p>", key))
 }
 
 async fn extend_key(Extension(state): Extension<AdminState>, Path(key): Path<String>, Query(p): Query<ExtendParams>) -> Html<String> {
-    let seconds = ttl_seconds_for_option(&p.option);
-    let _ = state.db.extend_key_by(&key, seconds).await;
+    if let Some(seconds) = ttl_seconds_for_option(&p.option) {
+        let _ = state.db.extend_key_by(&key, seconds).await;
+    } else {
+        // 永久：设置为很大时间
+        let _ = state.db.extend_key_by(&key, (i64::MAX/2) - chrono::Utc::now().timestamp()).await;
+    }
+    Html("<meta http-equiv=\"refresh\" content=\"0;url=/admin\">".to_string())
+}
+
+async fn set_key_active(Extension(state): Extension<AdminState>, Path((key, flag)): Path<(String, i32)>) -> Html<String> {
+    let _ = state.db.set_key_active(&key, flag != 0).await;
     Html("<meta http-equiv=\"refresh\" content=\"0;url=/admin\">".to_string())
 }
 
@@ -87,21 +150,17 @@ async fn index_html() -> Html<String> {
   <body>
     <h2>Keys Admin</h2>
     <form method='post' action='/api/keys'>
-      <label>Key (optional 16 chars): <input name='key' maxlength='64' /></label>
-      <label>Duration:
-        <select name='duration'>
-          <option value='1d'>1天</option>
-          <option value='7d'>7天</option>
-          <option value='1m' selected>1个月</option>
-          <option value='1q'>1个季度</option>
-          <option value='1y'>1年</option>
-        </select>
+      <label>Key（32位UUID，无-）: <input id='key' name='key' maxlength='32' pattern='[0-9a-fA-F]{32}' /></label>
+      <button type='button' onclick='gen()'>生成</button>
+      <label>时长:
+        <input id='duration' name='duration' placeholder='如: 10d/2w/3m/1y/permanent' />
       </label>
-      <label>Note: <input name='note' maxlength='200' /></label>
+      <label>备注: <input name='note' maxlength='200' /></label>
       <button type='submit'>新增Key</button>
     </form>
     <div id='list'></div>
     <script>
+      function gen(){ fetch('/api/keys/generate').then(r=>r.text()).then(t=>{ document.getElementById('key').value = t; }); }
       let offset = 0, limit = 20;
       async function load() {
         const res = await fetch(`/api/keys?offset=${offset}&limit=${limit}`);
@@ -116,8 +175,9 @@ async fn index_html() -> Html<String> {
               <a href='/api/keys/${k.licence_key}/extend?option=1d'>+1天</a>
               <a href='/api/keys/${k.licence_key}/extend?option=7d'>+7天</a>
               <a href='/api/keys/${k.licence_key}/extend?option=1m'>+1个月</a>
-              <a href='/api/keys/${k.licence_key}/extend?option=1q'>+1季度</a>
               <a href='/api/keys/${k.licence_key}/extend?option=1y'>+1年</a>
+              <a href='/api/keys/${k.licence_key}/extend?option=permanent'>永久</a>
+              ${k.active ? `<a href='/api/keys/${k.licence_key}/active/0' style='color:#c00'>作废</a>` : `<a href='/api/keys/${k.licence_key}/active/1'>启用</a>`}
             </td>
           </tr>`).join('');
         const totalPages = Math.ceil(data.total/limit);
@@ -147,7 +207,10 @@ pub async fn spawn_admin(db: Database, base_port: i32) {
     let app = Router::new()
         .route("/admin", get(index_html))
         .route("/api/keys", get(list_keys).post(create_key))
+        .route("/api/keys/generate", get(|| async { generate_default_key() }))
         .route("/api/keys/:key/extend", get(extend_key))
+        .route("/api/keys/:key/active/:flag", get(set_key_active))
+        .layer(middleware::from_fn(auth_middleware))
         .layer(axum::Extension(state));
 
     // Bind to localhost only

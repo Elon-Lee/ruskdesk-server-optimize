@@ -112,13 +112,21 @@ impl Database {
     }
 
     pub async fn get_peer(&self, id: &str) -> ResultType<Option<Peer>> {
-        Ok(sqlx::query_as!(
-            Peer,
+        let row = sqlx::query(
             "select guid, id, uuid, pk, user, status, info from peer where id = ?",
-            id
         )
+        .bind(id)
         .fetch_optional(self.pool.get().await?.deref_mut())
-        .await?)
+        .await?;
+        Ok(row.map(|r| Peer {
+            guid: r.try_get("guid").unwrap_or_default(),
+            id: r.try_get::<String, _>("id").unwrap_or_default(),
+            uuid: r.try_get("uuid").unwrap_or_default(),
+            pk: r.try_get("pk").unwrap_or_default(),
+            user: r.try_get("user").ok(),
+            info: r.try_get::<String, _>("info").unwrap_or_default(),
+            status: r.try_get("status").ok(),
+        }))
     }
 
     pub async fn insert_peer(
@@ -129,14 +137,12 @@ impl Database {
         info: &str,
     ) -> ResultType<Vec<u8>> {
         let guid = uuid::Uuid::new_v4().as_bytes().to_vec();
-        sqlx::query!(
-            "insert into peer(guid, id, uuid, pk, info) values(?, ?, ?, ?, ?)",
-            guid,
-            id,
-            uuid,
-            pk,
-            info
-        )
+        sqlx::query("insert into peer(guid, id, uuid, pk, info) values(?, ?, ?, ?, ?)")
+        .bind(&guid)
+        .bind(id)
+        .bind(uuid)
+        .bind(pk)
+        .bind(info)
         .execute(self.pool.get().await?.deref_mut())
         .await?;
         Ok(guid)
@@ -149,13 +155,11 @@ impl Database {
         pk: &[u8],
         info: &str,
     ) -> ResultType<()> {
-        sqlx::query!(
-            "update peer set id=?, pk=?, info=? where guid=?",
-            id,
-            pk,
-            info,
-            guid
-        )
+        sqlx::query("update peer set id=?, pk=?, info=? where guid=?")
+        .bind(id)
+        .bind(pk)
+        .bind(info)
+        .bind(guid)
         .execute(self.pool.get().await?.deref_mut())
         .await?;
         Ok(())
@@ -182,7 +186,7 @@ impl Database {
 
     pub async fn insert_key(&self, key: &str, expired_at: i64, active: bool, note: Option<&str>) -> ResultType<()> {
         let now = chrono::Utc::now().timestamp();
-        sqlx::query("insert or replace into licence_keys(licence_key, registered_at, expired_at, active, note) values(?, ?, ?, ?, ?)")
+        sqlx::query("insert into licence_keys(licence_key, registered_at, expired_at, active, note) values(?, ?, ?, ?, ?)")
         .bind(key)
         .bind(now)
         .bind(expired_at)
@@ -239,6 +243,14 @@ impl Database {
             .await?;
         let cnt: i64 = r.try_get("cnt").unwrap_or(0);
         Ok(cnt)
+    }
+
+    pub async fn key_exists(&self, key: &str) -> ResultType<bool> {
+        let r = sqlx::query("select 1 as exists_flag from licence_keys where licence_key = ? limit 1")
+            .bind(key)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(r.is_some())
     }
 }
 
